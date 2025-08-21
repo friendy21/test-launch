@@ -1,0 +1,119 @@
+name: CI/CD to Nomad
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/${{ secrets.DOCKERHUB_REPO || 'hello-image' }}
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Trivy on filesystem
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+          exit-code: '1'
+
+      - name: Upload Trivy results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  build-and-push:
+    needs: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Replace image in Nomad job
+        id: prep
+        run: |
+          IMAGE="${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          echo "Using image: $IMAGE"
+          sed -E 's|image = "[^"]+"|image = "'"$IMAGE"'"|' nomad/hello.nomad > nomad/hello.rendered.nomad
+          echo "job_file=nomad/hello.rendered.nomad" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to Nomad via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            set -euo pipefail
+            echo "Deploying to Nomad..."
+            cat > /tmp/hello.nomad <<'EOF'
+${{ steps.prep.outputs.job_file && fromJson('{"unsupported":"runner_cannot_inline"}') || '' }}
+EOF
+            # fallback: if inline heredoc failed (due to GitHub Actions limitation), pull from repo
+            if [ ! -s /tmp/hello.nomad ]; then
+              echo "Falling back to pulling raw file from GitHub..."
+              # Requires the repo to be public or use a PAT; simplest is to scp the file instead.
+            fi
+
+      - name: Copy job file to server and run nomad
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          source: "nomad/hello.rendered.nomad"
+          target: "/tmp/hello.rendered.nomad"
+
+      - name: Run Nomad job
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            export NOMAD_ADDR=${{ secrets.NOMAD_ADDR }}
+            export NOMAD_TOKEN=${{ secrets.NOMAD_TOKEN }}
+            which nomad || (echo "Nomad CLI not installed on server" && exit 1)
+            nomad job run /tmp/hello.rendered.nomad
