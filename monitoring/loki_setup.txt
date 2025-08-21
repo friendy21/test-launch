@@ -1,0 +1,15 @@
+# Loki Setup Instructions
+
+
+Objective:
+- Collect and view logs from all Docker containers (including Nomad jobs) using Promtail → Loki → Grafana.
+
+---
+
+## How Loki was started
+
+We are using Docker Compose to start Loki along with Grafana and Promtail:
+
+```bash
+cd devops_final
+docker compose up -d
